@@ -8,7 +8,7 @@ sync:
       location: "bmeares"
       columns:
         datetime: "start_date"
-        upload_id: "upload_id"
+        activity_id: "id"
 
 config:
   meerschaum:
