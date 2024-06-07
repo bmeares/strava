@@ -14,28 +14,69 @@ from meerschaum.connectors import make_connector
 from meerschaum.config import get_plugin_config, write_plugin_config
 from meerschaum.utils.prompt import prompt
 from meerschaum.utils.typing import Any, SuccessTuple
-from meerschaum.utils.warnings import warn
+from meerschaum.utils.warnings import warn, info
+from meerschaum.plugins import api_plugin
+from meerschaum.utils.daemon import daemon_action, Daemon
+from meerschaum.connectors.poll import retry_connect
 
-required = ['requests']
+required: list[str] = ['requests', 'stravalib']
 REFRESH_TOKEN_URL: str = "https://www.strava.com/api/v3/oauth/token"
 ATHLETE_URL: str = "https://www.strava.com/api/v3/athlete"
 ACTIVITIES_URL: str = "https://www.strava.com/api/v3/athlete/activities"
+API_JOB_NAME: str = "_strava_api"
+API_JOB_PORT: int = 3059
+API_JOB_URI: str = f"http://127.0.0.1:{API_JOB_PORT}"
+REDIRECT_URI: str= f"{API_JOB_URI}/strava/authorization"
 
 def setup() -> SuccessTuple:
     """
     Prompt the user for API credentials.
     """
+    from stravalib import Client
     cf = get_plugin_config(warn=False)
-    if cf:
-        return True, "Already configured credentials."
+    auth_cf = cf.get('auth', {})
+    client_id = auth_cf.get('client_id') or prompt("Client ID:")
+    client_secret = auth_cf.get('client_secret') or prompt("Client secret:", is_password=True)
+    refresh_token = auth_cf.get('refresh_token') or prompt("Refresh token:", is_password=True)
 
     write_plugin_config({
         'auth': {
-            'client_id': int(prompt("Client ID:")),
-            'client_secret': prompt("Client secret:", is_password=True),
-            'refresh_token': prompt("Refresh token:", is_password=True),
+            'client_id': client_id,
+            'client_secret': client_secret,
+            'refresh_token': refresh_token,
         }
     })
+
+    conn = mrsm.get_connector('api:strava', uri=API_JOB_URI)
+    success, msg = daemon_action(
+        action = ['start', 'api'],
+        port = API_JOB_PORT,
+        name = API_JOB_NAME,
+        mrsm_instance = 'sql:memory',
+    )
+    if not success:
+        warn(f"Failed to start Strava API server:\n{msg}")
+    if not retry_connect(
+        conn,
+        enforce_chaining = False,
+        enforce_login = False,
+        print_on_connect = False,
+        warn = False,
+    ):
+        warn("Failed to start the local Strava API server!")
+
+    client = Client()
+    auth_url = client.authorization_url(
+        client_id = client_id,
+        redirect_uri = REDIRECT_URI,
+        scope = 'activity:read_all',
+    )
+    info(f"Click the following link to authorize with Strava:\n\n{auth_url}\n")
+    prompt("Press Enter to continue:", icon=False)
+
+    daemon = Daemon(daemon_id=API_JOB_NAME)
+    daemon.kill()
+    daemon.cleanup()
     return True, "Success"
 
 
@@ -58,6 +99,32 @@ def fetch(
         headers = get_headers(),
     )
     return response.json()
+
+
+@api_plugin
+def init_api(app):
+    from fastapi.responses import HTMLResponse
+
+    @app.get('/strava/authorization', response_class=HTMLResponse)
+    def get_strava_authorization(code: str, scope: str):
+        refresh_access_token(authorization_code=code)
+
+        return """
+        <html>
+            <head>
+                <title>Authorized with Strava</title>
+                <style>
+                    * {
+                        font-family: "Arial";
+                    }
+                </style>
+            </head>
+            <body>
+                <h1>Successfully authorized with Strava!</h1>
+                <p>You may now close this page.<p>
+            </body>
+        </html>
+        """
 
 
 def get_athlete_id() -> int | None:
@@ -107,22 +174,26 @@ def get_access_token() -> str | None:
     return access_token
 
 
-def refresh_access_token() -> str | None:
+def refresh_access_token(authorization_code: str | None = None) -> str | None:
     """
     Return a new access token.
     """
     import requests
     cf = get_plugin_config()
+    token_key, token_val, grant_type = (
+        ('code', authorization_code, 'authorization_code')
+        if authorization_code is not None
+        else ('refresh_token', cf['auth']['refresh_token'], 'refresh_token')
+    )
+    params = {
+        'client_id': cf['auth']['client_id'],
+        'client_secret': cf['auth']['client_secret'],
+        'grant_type': grant_type,
+        token_key: token_val,
+    }
     response = requests.post(
         REFRESH_TOKEN_URL,
-        params = {
-            'client_id': cf['auth']['client_id'],
-            'client_secret': cf['auth']['client_secret'],
-            'grant_type': 'refresh_token',
-            'refresh_token': cf['auth']['refresh_token'],
-            'f': 'json',
-            'scope': 'activity:read_all',
-        },
+        params = params,
         timeout = 12,
     )
     if not response:
@@ -130,7 +201,9 @@ def refresh_access_token() -> str | None:
         return None
 
     token_payload = response.json()
-    cf['auth'] = token_payload
+    if 'auth' not in cf:
+        cf['auth'] = {}
+    cf['auth'].update(token_payload)
     if not write_plugin_config(cf):
         warn("Failed to save updated tokens!")
     return token_payload['access_token']
