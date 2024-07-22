@@ -7,8 +7,8 @@ services:
     ### Override the `bootstrap.sh` entrypoint for interactive development and testing.
     entrypoint: ["/app/docker/sleep_forever.sh"]
 
-    # environment:
-      # MRSM_STRAVA_MAIN: $MRSM_STRAVA_MAIN
+    environment:
+      MRSM_API_BMEARES: "$MRSM_API_BMEARES"
 
     network_mode: "host"
     volumes:

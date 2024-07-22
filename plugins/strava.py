@@ -11,9 +11,9 @@ from datetime import datetime, timezone, timedelta
 import pathlib
 import time
 import json
+import urllib.parse
 
 import meerschaum as mrsm
-from meerschaum.connectors import make_connector
 from meerschaum.config import get_plugin_config, write_plugin_config
 from meerschaum.utils.prompt import prompt
 from meerschaum.utils.typing import Any, SuccessTuple
@@ -22,27 +22,39 @@ from meerschaum.plugins import api_plugin
 from meerschaum.utils.daemon import daemon_action, Daemon
 from meerschaum.connectors.poll import retry_connect
 from meerschaum.config._paths import ROOT_DIR_PATH
+from meerschaum.utils.debug import dprint
 
-required: list[str] = ['requests', 'stravalib']
+__version__ = '0.1.0'
+required = ['requests', 'stravalib==2.0.0rc0']
+
 REFRESH_TOKEN_URL: str = "https://www.strava.com/api/v3/oauth/token"
 ATHLETE_URL: str = "https://www.strava.com/api/v3/athlete"
 ACTIVITIES_URL: str = "https://www.strava.com/api/v3/athlete/activities"
 API_JOB_NAME: str = "_strava_api"
 API_JOB_PORT: int = 3059
 API_JOB_URI: str = f"http://127.0.0.1:{API_JOB_PORT}"
-REDIRECT_URI: str= f"{API_JOB_URI}/strava/authorization"
+REDIRECT_URL_PATH: str = "/strava/authorization"
 AUTHORIZED_PATH: pathlib.Path = ROOT_DIR_PATH / '.strava-auth'
 
 def setup() -> SuccessTuple:
     """
     Prompt the user for API credentials.
     """
-    from stravalib import Client
-    cf = get_plugin_config(warn=False)
+    cf = get_plugin_config(warn=False) or {}
     auth_cf = cf.get('auth', {})
-    client_id = auth_cf.get('client_id') or prompt("Client ID:")
-    client_secret = auth_cf.get('client_secret') or prompt("Client secret:", is_password=True)
-    refresh_token = auth_cf.get('refresh_token') or prompt("Refresh token:", is_password=True)
+    info(
+        f"Make sure port {API_JOB_PORT} is open and accessible."
+        "\n   If you are running Dockerized Meerschaum, run `mrsm edit config stack` "
+        f"and add `{API_JOB_PORT}:{API_JOB_PORT}` under the `api` service."
+    )
+    try:
+        host = auth_cf.get('host_uri') or prompt("Host:", default='localhost')
+        client_id = auth_cf.get('client_id') or prompt("Client ID:")
+        client_secret = auth_cf.get('client_secret') or prompt("Client secret:", is_password=True)
+        refresh_token = auth_cf.get('refresh_token') or prompt("Refresh token:", is_password=True)
+    except Exception as e:
+        return True, "Success"
+    redirect_url = f"http://{host}:{API_JOB_PORT}{REDIRECT_URL_PATH}"
 
     write_plugin_config({
         'auth': {
@@ -71,11 +83,10 @@ def setup() -> SuccessTuple:
     ):
         warn("Failed to start the local Strava API server!")
 
-    client = Client()
-    auth_url = client.authorization_url(
-        client_id = client_id,
-        redirect_uri = REDIRECT_URI,
-        scope = 'activity:read_all',
+    auth_url = (
+        f"https://www.strava.com/oauth/authorize?client_id={client_id}"
+        + f"&redirect_uri={urllib.parse.quote_plus(redirect_url)}"
+        + "&approval_prompt=auto&scope=activity%3Aread_all&response_type=code"
     )
     info(f"Click the following link to authorize with Strava:\n\n{auth_url}\n")
 
@@ -94,21 +105,34 @@ def fetch(
         pipe: mrsm.Pipe,
         begin: datetime | None = None,
         end: datetime | None = None,
+        debug: bool = False,
         **kwargs: Any
     ):
     """
+    Fetch activities from Strava.
     """
     import requests
     from stravalib import Client
     client = get_client()
+
+    if not begin:
+        begin = pipe.get_sync_time(debug=debug)
+
+    if begin:
+        begin -= pipe.get_backtrack_interval(debug=debug)
+
     activities = client.get_activities(
         after = begin if begin is not None else None,
         before = end if end is not None else None,
     )
+    if debug:
+        dprint("Iterating over Strava activities...")
     docs = []
     for activity in activities:
         doc = json.loads(activity.json())
         start_date = activity.start_date
+        if debug:
+            dprint(f"Loading activity from '{start_date}'...")
         try:
             streams = client.get_activity_streams(activity.id)
         except Exception as e:
@@ -138,17 +162,6 @@ def fetch(
     return docs
 
 
-def get_activities_pipe(activity):
-    return mrsm.Pipe(
-        'plugin:strava',
-        'activity',
-        str(activity.id),
-        columns = {
-            'datetime': 'timestamp',
-
-        },
-    )
-
 def get_client():
     """
     Return the Strava client with the current access token.
@@ -162,7 +175,7 @@ def get_client():
 def init_api(app):
     from fastapi.responses import HTMLResponse
 
-    @app.get('/strava/authorization', response_class=HTMLResponse)
+    @app.get(REDIRECT_URL_PATH, response_class=HTMLResponse)
     def get_strava_authorization(code: str, scope: str):
         refresh_access_token(authorization_code=code)
         with open(AUTHORIZED_PATH, 'w', encoding='utf-8') as f:
